@@ -48,13 +48,74 @@ const dateRangeMatch = ({ startDate, endDate } = {}) => {
 const ADMIN_STATUSES = ['Processing', 'Preparing', 'Shipped', 'Delivered']
 const STATUS_FLOW = ['Pending', 'Processing', 'Shipped', 'Delivered']
 
+const groupOrderQuantities = orderItems => {
+    const quantities = new Map()
+    for (const item of orderItems || []) {
+        if (!item || typeof item !== 'object') {
+            throw new Error('Each order item must be valid.')
+        }
+        const quantity = Number(item.quantity)
+        if (!/^[a-f\d]{24}$/i.test(String(item.product || '')) || !Number.isInteger(quantity) || quantity < 1) {
+            throw new Error('Each order item must have a valid product and a quantity of at least 1.')
+        }
+        const productId = String(item.product)
+        quantities.set(productId, (quantities.get(productId) || 0) + quantity)
+    }
+    return quantities
+}
+
+const deductOrderStock = async (quantities) => {
+    const adjusted = []
+    try {
+        for (const [productId, quantity] of quantities) {
+            const product = await Product.findOneAndUpdate(
+                { _id: productId, stock: { $gte: quantity } },
+                { $inc: { stock: -quantity } },
+                { new: true }
+            )
+            if (!product) {
+                const current = await Product.findById(productId).select('name stock')
+                if (!current) throw new Error('An item in this order is no longer available.')
+                throw new Error(`Only ${current.stock} unit(s) of ${current.name} are currently available.`)
+            }
+            adjusted.push({ productId, quantity })
+        }
+        return adjusted
+    } catch (error) {
+        await Promise.all(adjusted.map(({ productId, quantity }) =>
+            Product.updateOne({ _id: productId }, { $inc: { stock: quantity } })
+        ))
+        throw error
+    }
+}
+
+const restoreOrderStock = async adjusted => Promise.all((adjusted || []).map(({ productId, quantity }) =>
+    Product.updateOne({ _id: productId }, { $inc: { stock: quantity } })
+))
+
 // POST /order/new
 exports.newOrder = async (req, res) => {
     try {
         const { orderItems, shippingInfo, itemsPrice, taxPrice, shippingPrice, totalPrice, paymentInfo } = req.body
 
-        if (!orderItems || orderItems.length === 0) {
+        if (!Array.isArray(orderItems) || orderItems.length === 0) {
             return fail(res, 'No order items', 400)
+        }
+
+        let requestedQuantities
+        try {
+            requestedQuantities = groupOrderQuantities(orderItems)
+        } catch (error) {
+            return fail(res, error.message, 400)
+        }
+        const products = await Product.find({ _id: { $in: [...requestedQuantities.keys()] } }).select('name stock')
+        const productsById = new Map(products.map(product => [String(product._id), product]))
+        for (const [productId, quantity] of requestedQuantities) {
+            const product = productsById.get(productId)
+            if (!product) return fail(res, 'An item in your cart is no longer available.', 400)
+            if (quantity > product.stock) {
+                return fail(res, `Only ${product.stock} unit(s) of ${product.name} are currently available.`, 400)
+            }
         }
 
         // orderStatus is not taken from the body, the model default ('Pending') is used
@@ -158,8 +219,7 @@ exports.cancelOrder = async (req, res) => {
         if (order.orderStatus !== 'Pending') {
             return fail(res, 'This order can no longer be cancelled', 400)
         }
-
-        // stock is only reduced on delivery, so there is nothing to put back here
+        // Pending orders do not reserve inventory, so there is nothing to put back here.
         order.orderStatus = 'Cancelled'
         await order.save()
 
@@ -190,7 +250,7 @@ exports.allOrders = async (req, res) => {
 // PUT /admin/order/:id   body: { status }
 exports.updateOrder = async (req, res) => {
     try {
-        const order = await Order.findById(req.params.id).populate('user', 'name email')
+        let order = await Order.findById(req.params.id).populate('user', 'name email')
 
         if (!order) {
             return fail(res, 'No order found with this ID', 404)
@@ -203,7 +263,6 @@ exports.updateOrder = async (req, res) => {
         if (order.orderStatus === 'Cancelled') {
             return fail(res, 'This order was cancelled by the customer', 400)
         }
-
         const { status } = req.body
         if (!ADMIN_STATUSES.includes(status)) {
             return fail(res, 'Please choose a valid status', 400)
@@ -214,24 +273,35 @@ exports.updateOrder = async (req, res) => {
         const nextStatus = status === 'Preparing' ? 'Processing' : status
         const currentStatusIndex = STATUS_FLOW.indexOf(currentStatus)
         const nextStatusIndex = STATUS_FLOW.indexOf(nextStatus)
-        if (currentStatusIndex < 0 || nextStatusIndex <= currentStatusIndex) {
-            return fail(res, 'Order status cannot move backward or remain unchanged', 400)
+        if (currentStatusIndex < 0 || nextStatusIndex !== currentStatusIndex + 1) {
+            return fail(res, 'Order status must move forward one step at a time', 400)
         }
 
-        // stock goes down once, when the order is delivered
-        if (status === 'Delivered') {
-            for (const item of order.orderItems) {
-                const product = await Product.findById(item.product)
-                if (product) {
-                    product.stock = Math.max(0, product.stock - item.quantity)
-                    await product.save({ validateBeforeSave: false })
+        const shouldDeductStock = (nextStatus === 'Processing' && currentStatus === 'Pending') ||
+            (nextStatus === 'Shipped' && currentStatus === 'Processing' && !order.stockDeducted)
+        if (shouldDeductStock) {
+            let adjustedStock = []
+            try {
+                adjustedStock = await deductOrderStock(groupOrderQuantities(order.orderItems))
+                const processedOrder = await Order.findOneAndUpdate(
+                    { _id: order._id, orderStatus: order.orderStatus, stockDeducted: { $ne: true } },
+                    { $set: { orderStatus: nextStatus, stockDeducted: true } },
+                    { new: true }
+                ).populate('user', 'name email')
+                if (!processedOrder) {
+                    await restoreOrderStock(adjustedStock)
+                    return fail(res, 'This order has already changed. Refresh and try again.', 409)
                 }
+                order = processedOrder
+            } catch (error) {
+                await restoreOrderStock(adjustedStock)
+                return fail(res, error.message, 409)
             }
-            order.deliveredAt = Date.now()
+        } else {
+            order.orderStatus = nextStatus
+            if (nextStatus === 'Delivered') order.deliveredAt = Date.now()
+            await order.save()
         }
-
-        order.orderStatus = nextStatus
-        await order.save()
 
         let emailSent = false
         let emailError
