@@ -70,7 +70,43 @@ exports.newOrder = async (req, res) => {
             user: req.user._id
         })
 
-        res.status(200).json({ success: true, order })
+        await order.populate('user', 'name email')
+
+        let emailSent = false
+        let emailError
+        if (order.user?.email) {
+            const customerName = escapeHtml(order.user.name || 'Customer')
+            const orderNumber = escapeHtml(order._id)
+            const rows = (order.orderItems || []).map(item => `
+                <tr><td style="padding:12px;border-bottom:1px solid #e3e9e5">${escapeHtml(item.name)}<br><span style="color:#6b7a73;font-size:12px">${escapeHtml(item.shade || 'Standard')} · Qty ${Number(item.quantity || 0)}</span></td>
+                <td style="padding:12px;border-bottom:1px solid #e3e9e5;text-align:right">${peso(Number(item.price || 0) * Number(item.quantity || 0))}</td></tr>`).join('')
+            const ship = order.shippingInfo || {}
+            const address = [ship.address, ship.city, ship.postalCode, ship.country].filter(Boolean).map(escapeHtml).join(', ')
+            const paymentStatus = order.paymentInfo?.status === 'succeeded' || order.paymentInfo?.id?.startsWith('CARD-') ? 'Paid' : 'Pay on delivery'
+            const logoPath = path.join(__dirname, '../../frontend/src/assets/cartify_logo.png')
+            const html = `<div style="background:#f2f6f3;padding:28px 12px;font-family:Arial,Helvetica,sans-serif;color:#263a31"><table style="width:100%;max-width:640px;margin:auto;background:#fff;border:1px solid #e3e9e5;border-collapse:collapse"><tr><td style="padding:22px 28px;background:#17332a;border-bottom:4px solid #c9a227"><img src="cid:cartify-logo" width="142" alt="Cartify" style="display:block"></td></tr><tr><td style="padding:28px"><div style="color:#8c7418;font-size:12px;font-weight:bold;letter-spacing:1px">ORDER CONFIRMATION</div><h1 style="color:#17332a;font-size:24px">Thanks for your order, ${customerName}!</h1><p>Your order is confirmed and is now <strong>Pending</strong>. We’ll email you as its status changes.</p><p><strong>Order #${orderNumber}</strong><br>${new Date(order.createdAt || Date.now()).toLocaleDateString('en-PH')}</p><table style="width:100%;border-collapse:collapse">${rows}</table><p>Subtotal: ${peso(order.itemsPrice)}<br>Shipping: ${peso(order.shippingPrice)}<br>Tax: ${peso(order.taxPrice)}<br><strong style="font-size:17px">Total: ${peso(order.totalPrice)}</strong></p><p><strong>Delivering to</strong><br>${customerName}<br>${address}<br>${escapeHtml(ship.phoneNo || '')}</p><p><strong>Payment:</strong> ${paymentStatus}</p></td></tr><tr><td style="padding:20px;background:#17332a;color:white;text-align:center">Your itemized PDF receipt is attached.<br>Thanks for shopping with Cartify!</td></tr></table></div>`
+            const text = `Thanks for your order, ${order.user.name || 'Customer'}!\n\nOrder #${order._id}\nStatus: Pending\nTotal: ${peso(order.totalPrice)}\nPayment: ${paymentStatus}\nDelivering to: ${[ship.address, ship.city, ship.postalCode, ship.country].filter(Boolean).join(', ')}\n\nYour itemized PDF receipt is attached.`
+            try {
+                await sendEmail({
+                    email: order.user.email,
+                    subject: `Your Cartify order #${order._id} is confirmed`,
+                    text,
+                    html,
+                    attachments: [
+                        { filename: `Cartify-Receipt-${order._id}.pdf`, content: createOrderReceipt(order, order.user), contentType: 'application/pdf' },
+                        { filename: 'cartify-logo.png', path: logoPath, cid: 'cartify-logo', contentDisposition: 'inline' },
+                    ],
+                })
+                emailSent = true
+            } catch (error) {
+                emailError = error.message
+                console.error(`Order confirmation email failed for ${order._id}: ${error.message}`)
+            }
+        } else {
+            emailError = 'Customer email address is unavailable.'
+        }
+
+        res.status(200).json({ success: true, order, emailSent, emailError })
     } catch (error) {
         fail(res, error)
     }
