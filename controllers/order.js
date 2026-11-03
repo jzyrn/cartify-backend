@@ -271,19 +271,22 @@ exports.updateOrder = async (req, res) => {
         const nextStatus = status === 'Preparing' ? 'Processing' : status
         const currentStatusIndex = STATUS_FLOW.indexOf(currentStatus)
         const nextStatusIndex = STATUS_FLOW.indexOf(nextStatus)
-        if (currentStatusIndex < 0 || nextStatusIndex !== currentStatusIndex + 1) {
-            return fail(res, 'Order status must move forward one step at a time', 400)
+        if (currentStatusIndex < 0 || nextStatusIndex <= currentStatusIndex) {
+            return fail(res, 'Order status must move forward.', 400)
         }
 
-        const shouldDeductStock = (nextStatus === 'Processing' && currentStatus === 'Pending') ||
-            (nextStatus === 'Shipped' && currentStatus === 'Processing' && !order.stockDeducted)
+        const processingIndex = STATUS_FLOW.indexOf('Processing')
+        const shouldDeductStock = !order.stockDeducted &&
+            currentStatusIndex < nextStatusIndex && nextStatusIndex >= processingIndex
         if (shouldDeductStock) {
             let adjustedStock = []
             try {
                 adjustedStock = await deductOrderStock(groupOrderQuantities(order.orderItems))
+                const updateFields = { orderStatus: nextStatus, stockDeducted: true }
+                if (nextStatus === 'Delivered') updateFields.deliveredAt = Date.now()
                 const processedOrder = await Order.findOneAndUpdate(
                     { _id: order._id, orderStatus: order.orderStatus, stockDeducted: { $ne: true } },
-                    { $set: { orderStatus: nextStatus, stockDeducted: true } },
+                    { $set: updateFields },
                     { new: true }
                 ).populate('user', 'name email')
                 if (!processedOrder) {
