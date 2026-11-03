@@ -206,14 +206,20 @@ exports.forgotPassword = async (req, res) => {
     const resetToken = user.getResetPasswordToken()
     await user.save({ validateBeforeSave: false })
 
-    const frontend = process.env.FRONTEND_URL || 'http://localhost:5173'
+    const frontend = (process.env.FRONTEND_URL || req.get('origin') || 'http://localhost:5173').replace(/\/+$/, '')
     const resetUrl = `${frontend}/password/reset/${resetToken}`
     const message = `Your password reset link is:\n\n${resetUrl}\n\nIt expires in 30 minutes. If you did not request this, ignore this email.`
 
     try {
-        await sendEmail({ email: user.email, subject: 'Cartify Password Recovery', message })
+        await sendEmail({
+            email: user.email,
+            subject: 'Cartify Password Recovery',
+            message,
+            html: `<p>We received a request to reset your Cartify password.</p><p><a href="${resetUrl}">Reset your password</a></p><p>This link expires in 30 minutes. If you did not request this, ignore this email.</p>`
+        })
         res.status(200).json(reply)
     } catch (err) {
+        console.error('Password reset email delivery failed:', err.message)
         user.resetPasswordToken = undefined
         user.resetPasswordExpire = undefined
         await user.save({ validateBeforeSave: false })
